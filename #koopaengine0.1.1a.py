@@ -161164,6 +161164,17 @@ class Level:
 # FILE I/O (SMBX .lvl, .38a, .lvlx, .kengine)
 # -------------------------
 
+def _u32(n):
+    """Coerce to unsigned 32-bit for struct '<I' (maps -1 → 0xFFFFFFFF)."""
+    return int(n) & 0xFFFFFFFF
+
+
+def _i32_from_u32(n):
+    """Interpret packed u32 bits as signed i32 (0xFFFFFFFF → -1)."""
+    n = int(n) & 0xFFFFFFFF
+    return n - 0x100000000 if n & 0x80000000 else n
+
+
 def _lvl_bytes(level):
     fd, path = tempfile.mkstemp(suffix=".lvl")
     os.close(fd)
@@ -161309,6 +161320,7 @@ def read_lvl(filename):
                 num_blocks = struct.unpack('<I', f.read(4))[0]
                 for _ in range(num_blocks):
                     x, y, type_id, layer, event_id, flags = struct.unpack('<IIIIII', f.read(24))
+                    x, y, event_id = _i32_from_u32(x), _i32_from_u32(y), _i32_from_u32(event_id)
                     if type_id in TILE_ID_TO_NAME:
                         tile = Tile(x, y, TILE_ID_TO_NAME[type_id], layer, event_id, flags)
                         while len(section.layers) <= layer:
@@ -161318,6 +161330,7 @@ def read_lvl(filename):
                 num_bgos = struct.unpack('<I', f.read(4))[0]
                 for _ in range(num_bgos):
                     x, y, type_id, layer, flags = struct.unpack('<IIIII', f.read(20))
+                    x, y = _i32_from_u32(x), _i32_from_u32(y)
                     if type_id in BGO_ID_TO_NAME:
                         bgo = BGO(x, y, BGO_ID_TO_NAME[type_id], layer, flags=flags)
                         while len(section.layers) <= layer:
@@ -161327,6 +161340,8 @@ def read_lvl(filename):
                 num_npcs = struct.unpack('<I', f.read(4))[0]
                 for _ in range(num_npcs):
                     x, y, type_id, layer, event_id, flags, direction, special = struct.unpack('<IIIIIIII', f.read(32))
+                    x, y, event_id = _i32_from_u32(x), _i32_from_u32(y), _i32_from_u32(event_id)
+                    special = _i32_from_u32(special)
                     if type_id in NPC_ID_TO_NAME:
                         npc = NPC(x, y, NPC_ID_TO_NAME[type_id], layer, event_id, flags,
                                   direction=1 if direction else -1, special_data=special)
@@ -161363,21 +161378,21 @@ def write_lvl(filename, level):
         f.write(name_bytes.ljust(32, b'\x00'))
         author_bytes = level.author.encode('utf-8')[:31] + b'\x00'
         f.write(author_bytes.ljust(32, b'\x00'))
-        f.write(struct.pack('<I', level.time_limit))
-        f.write(struct.pack('<I', level.stars))
+        f.write(struct.pack('<I', _u32(level.time_limit)))
+        f.write(struct.pack('<I', _u32(level.stars)))
         flags = (1 if level.no_background else 0)
-        f.write(struct.pack('<I', flags))
+        f.write(struct.pack('<I', _u32(flags)))
         f.write(b'\x00' * (128 - f.tell()))
 
-        f.write(struct.pack('<I', len(level.sections)))
+        f.write(struct.pack('<I', _u32(len(level.sections))))
         for section in level.sections:
-            f.write(struct.pack('<I', section.width))
-            f.write(struct.pack('<I', section.height))
+            f.write(struct.pack('<I', _u32(section.width)))
+            f.write(struct.pack('<I', _u32(section.height)))
             f.write(struct.pack('<BBB', *section.bg_color[:3]))
             f.write(b'\x00')
-            f.write(struct.pack('<I', section.start_x))
-            f.write(struct.pack('<I', section.start_y))
-            f.write(struct.pack('<I', section.music))
+            f.write(struct.pack('<I', _u32(section.start_x)))
+            f.write(struct.pack('<I', _u32(section.start_y)))
+            f.write(struct.pack('<I', _u32(section.music)))
 
             blocks = []
             for li, layer in enumerate(section.layers):
@@ -161385,8 +161400,9 @@ def write_lvl(filename, level):
                     type_id = TILE_SMBX_IDS.get(t.tile_type, 1)
                     event_id = t.event_id if hasattr(t, 'event_id') else -1
                     flags = t.flags if hasattr(t, 'flags') else 0
-                    blocks.append((t.rect.x, t.rect.y, type_id, li, event_id, flags))
-            f.write(struct.pack('<I', len(blocks)))
+                    blocks.append((_u32(t.rect.x), _u32(t.rect.y), _u32(type_id),
+                                   _u32(li), _u32(event_id), _u32(flags)))
+            f.write(struct.pack('<I', _u32(len(blocks))))
             for b in blocks:
                 f.write(struct.pack('<IIIIII', *b))
 
@@ -161395,8 +161411,9 @@ def write_lvl(filename, level):
                 for b in layer.bgos:
                     type_id = BGO_SMBX_IDS.get(b.bgo_type, 5)
                     flags = b.flags if hasattr(b, 'flags') else 0
-                    bgos.append((b.rect.x, b.rect.y, type_id, li, flags))
-            f.write(struct.pack('<I', len(bgos)))
+                    bgos.append((_u32(b.rect.x), _u32(b.rect.y), _u32(type_id),
+                                 _u32(li), _u32(flags)))
+            f.write(struct.pack('<I', _u32(len(bgos))))
             for bg in bgos:
                 f.write(struct.pack('<IIIII', *bg))
 
@@ -161408,16 +161425,18 @@ def write_lvl(filename, level):
                     flags = n.flags if hasattr(n, 'flags') else 0
                     direction = 1 if n.direction > 0 else 0
                     special = n.special_data if hasattr(n, 'special_data') else 0
-                    npcs.append((n.rect.x, n.rect.y, type_id, li, event_id, flags, direction, special))
-            f.write(struct.pack('<I', len(npcs)))
+                    npcs.append((_u32(n.rect.x), _u32(n.rect.y), _u32(type_id),
+                                 _u32(li), _u32(event_id), _u32(flags),
+                                 _u32(direction), _u32(special)))
+            f.write(struct.pack('<I', _u32(len(npcs))))
             for n in npcs:
                 f.write(struct.pack('<IIIIIIII', *n))
 
-            f.write(struct.pack('<I', len(section.warps)))
+            f.write(struct.pack('<I', _u32(len(section.warps))))
             for warp in section.warps:
                 f.write(b'\x00' * 64)
 
-            f.write(struct.pack('<I', len(section.events)))
+            f.write(struct.pack('<I', _u32(len(section.events))))
             for event in section.events:
                 name_bytes = event.name.encode('utf-8')
                 f.write(struct.pack('<B', len(name_bytes)))
