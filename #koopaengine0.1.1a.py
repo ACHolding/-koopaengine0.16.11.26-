@@ -162476,16 +162476,39 @@ class Editor:
 
     # ---- COORD HELPERS ----
     def world_to_grid(self, wx, wy):
-        return (int(wx)//GRID_SIZE)*GRID_SIZE, (int(wy)//GRID_SIZE)*GRID_SIZE
+        # Floor-snap so negative coords and float camera/zoom math land on true cells
+        return (math.floor(wx / GRID_SIZE) * GRID_SIZE,
+                math.floor(wy / GRID_SIZE) * GRID_SIZE)
 
     def get_mouse_world(self):
         mx, my = self.mouse_pos
-        return ((mx - SIDEBAR_WIDTH)/self.camera.zoom - self.camera.camera.x,
-                (my - CANVAS_Y)/self.camera.zoom - self.camera.camera.y)
+        return self.canvas_to_world(mx, my)
 
     def canvas_to_world(self, sx, sy):
-        return (sx - SIDEBAR_WIDTH)/self.camera.zoom - self.camera.camera.x, \
-               (sy - CANVAS_Y)/self.camera.zoom - self.camera.camera.y
+        z = self.camera.zoom
+        cam = self.camera.camera
+        return ((sx - SIDEBAR_WIDTH) / z - cam.x,
+                (sy - CANVAS_Y) / z - cam.y)
+
+    def world_to_canvas(self, wx, wy):
+        """World → screen (canvas) pixels; inverse of canvas_to_world."""
+        z = self.camera.zoom
+        cam = self.camera.camera
+        return ((wx + cam.x) * z + SIDEBAR_WIDTH,
+                (wy + cam.y) * z + CANVAS_Y)
+
+    def _blit_world(self, surf, image, wx, wy):
+        """Blit a sprite at world coords with camera + zoom applied."""
+        z = self.camera.zoom
+        sx, sy = self.world_to_canvas(wx, wy)
+        if abs(z - 1.0) < 1e-6:
+            surf.blit(image, (int(sx), int(sy)))
+            return int(sx), int(sy), image.get_width(), image.get_height()
+        iw = max(1, int(round(image.get_width() * z)))
+        ih = max(1, int(round(image.get_height() * z)))
+        scaled = pygame.transform.scale(image, (iw, ih))
+        surf.blit(scaled, (int(sx), int(sy)))
+        return int(sx), int(sy), iw, ih
 
     # ---- OBJECT PLACEMENT ----
     def place_object(self, gx, gy):
@@ -162845,60 +162868,75 @@ class Editor:
         if self.grid_enabled:
             zoom = self.camera.zoom
             cam = self.camera.camera
-            sc = int(-cam.x // GRID_SIZE)
-            ec = sc + int(CANVAS_WIDTH/(GRID_SIZE*zoom)) + 2
-            sr = int(-cam.y // GRID_SIZE)
-            er = sr + int(CANVAS_HEIGHT/(GRID_SIZE*zoom)) + 2
+            sc = int(math.floor(-cam.x / GRID_SIZE))
+            ec = sc + int(CANVAS_WIDTH / (GRID_SIZE * zoom)) + 2
+            sr = int(math.floor(-cam.y / GRID_SIZE))
+            er = sr + int(CANVAS_HEIGHT / (GRID_SIZE * zoom)) + 2
             for c in range(sc, ec):
-                px = c*GRID_SIZE + cam.x + SIDEBAR_WIDTH
+                px = (c * GRID_SIZE + cam.x) * zoom + SIDEBAR_WIDTH
                 if canvas_rect.left < px < canvas_rect.right:
                     pygame.draw.line(surf, SMBX_GRID, (px, canvas_rect.y), (px, canvas_rect.bottom))
             for r in range(sr, er):
-                py = r*GRID_SIZE + cam.y + CANVAS_Y
+                py = (r * GRID_SIZE + cam.y) * zoom + CANVAS_Y
                 if canvas_rect.top < py < canvas_rect.bottom:
                     pygame.draw.line(surf, SMBX_GRID, (canvas_rect.x, py), (canvas_rect.right, py))
 
-        # Sprites
+        # Sprites (camera + zoom — must match canvas_to_world / placement)
         section = self.level.current_section()
+        zoom = self.camera.zoom
         for layer in section.layers:
             if not layer.visible:
                 continue
             for bgo in layer.bgos:
-                p = bgo.rect.move(self.camera.camera.x + SIDEBAR_WIDTH, self.camera.camera.y + CANVAS_Y)
-                surf.blit(bgo.image, p)
+                self._blit_world(surf, bgo.image, bgo.rect.x, bgo.rect.y)
             for tile in layer.tiles:
-                p = tile.rect.move(self.camera.camera.x + SIDEBAR_WIDTH, self.camera.camera.y + CANVAS_Y)
-                surf.blit(tile.image, p)
-            cam_x = self.camera.camera.x + SIDEBAR_WIDTH
-            cam_y = self.camera.camera.y + CANVAS_Y
+                self._blit_world(surf, tile.image, tile.rect.x, tile.rect.y)
             for npc in layer.npcs:
-                x, y = _npc_blit_pos(npc, cam_x, cam_y)
-                surf.blit(npc.image, (x, y))
+                # NPC gfx anchors are in world space; convert via unscaled offset then zoom
+                bx, by = _npc_blit_pos(npc, 0, 0)
+                self._blit_world(surf, npc.image, bx, by)
 
         # Selection outlines
         if not self.playtest_mode:
-            cam_x = self.camera.camera.x + SIDEBAR_WIDTH
-            cam_y = self.camera.camera.y + CANVAS_Y
             for obj in self.selection:
                 if isinstance(obj, NPC):
-                    x, y = _npc_blit_pos(obj, cam_x, cam_y)
-                    outline = pygame.Rect(x, y, obj.image.get_width(), obj.image.get_height())
+                    bx, by = _npc_blit_pos(obj, 0, 0)
+                    sx, sy = self.world_to_canvas(bx, by)
+                    iw = max(1, int(round(obj.image.get_width() * zoom)))
+                    ih = max(1, int(round(obj.image.get_height() * zoom)))
+                    outline = pygame.Rect(int(sx), int(sy), iw, ih)
                 else:
-                    outline = obj.rect.move(cam_x, cam_y)
+                    sx, sy = self.world_to_canvas(obj.rect.x, obj.rect.y)
+                    ow = getattr(obj, 'width', obj.rect.width)
+                    oh = getattr(obj, 'height', obj.rect.height)
+                    outline = pygame.Rect(int(sx), int(sy),
+                                          max(1, int(round(ow * zoom))),
+                                          max(1, int(round(oh * zoom))))
                 pygame.draw.rect(surf, YELLOW, outline, 2)
                 pygame.draw.rect(surf, WHITE, outline.inflate(2, 2), 1)
 
         # Start position marker
-        sp = pygame.Rect(section.start_x + self.camera.camera.x + SIDEBAR_WIDTH,
-                         section.start_y + self.camera.camera.y + CANVAS_Y,
-                         GRID_SIZE, GRID_SIZE)
+        sx, sy = self.world_to_canvas(section.start_x, section.start_y)
+        sp = pygame.Rect(int(sx), int(sy),
+                         max(1, int(round(GRID_SIZE * zoom))),
+                         max(1, int(round(GRID_SIZE * zoom))))
         if not self.playtest_mode:
             pygame.draw.rect(surf, GREEN, sp, 2)
             draw_text(surf, "S", (sp.x+2, sp.y+2), GREEN, FONT_SMALL)
 
         # Player
         if self.playtest_mode and self.player:
-            self.player.draw(surf, (self.camera.camera.x + SIDEBAR_WIDTH, self.camera.camera.y + CANVAS_Y))
+            # Player.draw expects pixel camera offset at zoom 1; use world_to_canvas path
+            ox, oy = self.world_to_canvas(0, 0)
+            if abs(zoom - 1.0) < 1e-6:
+                self.player.draw(surf, (ox, oy))
+            else:
+                # Approximate zoomed player blit via image scale
+                img = self.player.image
+                iw = max(1, int(round(img.get_width() * zoom)))
+                ih = max(1, int(round(img.get_height() * zoom)))
+                px, py = self.world_to_canvas(self.player.rect.x, self.player.rect.y)
+                surf.blit(pygame.transform.scale(img, (iw, ih)), (int(px), int(py)))
 
         surf.set_clip(None)
 
